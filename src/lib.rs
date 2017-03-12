@@ -1,6 +1,17 @@
+#![cfg_attr(feature = "nightly", feature(unique))]
+
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::{mem, ptr};
+
+
+type Invariant<T> = PhantomData<*mut T>;
+
+#[cfg(not(feature = "nightly"))]
+type WithVtablePtr = *mut WithVtable;
+
+#[cfg(feature = "nightly")]
+type WithVtablePtr = ptr::Unique<WithVtable>;
 
 #[macro_export]
 macro_rules! thin_dst (
@@ -11,6 +22,8 @@ macro_rules! thin_dst (
         }
     )
 );
+
+pub mod atomic;
 
 #[derive(Debug)]
 struct FatPtr {
@@ -64,10 +77,7 @@ impl<T: ?Sized> ThinPrimer<T> {
             (*obj_ptr).vtable = fat_ptr.vtable;
         }
 
-        ThinDst {
-            ptr: obj_ptr,
-            _trait: PhantomData,
-        }
+        ThinDst::from_ptr(obj_ptr)
     }
 }
 
@@ -75,7 +85,7 @@ impl<T: ?Sized> ThinPrimer<T> {
 #[derive(Debug)]
 struct WithVtable {
     vtable: *const (),
-    data: i32,
+    data: (),
 }
 
 impl WithVtable {
@@ -90,13 +100,61 @@ impl WithVtable {
 }
 
 pub struct ThinDst<T: ?Sized> {
-    ptr: *mut WithVtable,
-    _trait: PhantomData<T>,
+    ptr: WithVtablePtr,
+    _type: Invariant<T>,
 }
 
 impl<T: ?Sized> ThinDst<T> {
+    fn from_nullable_ptr(ptr: *mut WithVtable) -> Option<Self> {
+        if ptr.is_null() {
+            None
+        } else {
+            Some(Self::from_ptr(ptr))
+        }
+    }
+}
+
+#[cfg(not(feature = "nightly"))]
+impl<T: ?Sized> ThinDst<T> {
+    fn from_ptr(ptr: *mut WithVtable) -> Self {
+        assert!(!ptr.is_null());
+
+        ThinDst {
+            ptr: ptr,
+            _type: PhantomData,
+        }
+    }
+
     unsafe fn primer_ptr(&self) -> *mut ThinPrimer<T> {
         WithVtable::fat_ptr(self.ptr).to_ptr()
+    }
+
+    fn into_ptr(self) -> *mut WithVtable {
+        let ptr = self.ptr;
+        mem::forget(self);
+        ptr
+    }
+}
+
+#[cfg(feature = "nightly")]
+impl<T: ?Sized> ThinDst<T> {
+    fn from_ptr(ptr: *mut WithVtable) -> Self {
+        assert!(!ptr.is_null());
+
+        ThinDst {
+            ptr: unsafe { ptr::Unique::new(ptr) },
+            _type: PhantomData,
+        }
+    }
+
+    unsafe fn primer_ptr(&self) -> *mut ThinPrimer<T> {
+        WithVtable::fat_ptr(*self.ptr).to_ptr()
+    }
+
+    fn into_ptr(self) -> *mut WithVtable {
+        let ptr = *self.ptr;
+        mem::forget(self);
+        ptr
     }
 }
 
@@ -125,6 +183,9 @@ impl<T: ?Sized> Drop for ThinDst<T> {
         }
     }
 }
+
+unsafe impl<T: Send + ?Sized> Send for ThinDst<T> {}
+unsafe impl<T: Sync + ?Sized> Sync for ThinDst<T> {}
 
 #[test]
 fn test_basic() {
